@@ -219,39 +219,43 @@ class MarketDataGUI:
             logger.error(f"Error updating BTC price: {e}")
             
     def update_market_data_table(self):
-        """Update market data table"""
+        """Update market data table with sorted display"""
         try:
             # Clear existing items
             for item in self.market_tree.get_children():
                 self.market_tree.delete(item)
                 
-            # Get current market data
-            market_data = self.data_manager.get_all_market_data()
-            instruments = market_data.get('instruments', {})
-            orderbooks = market_data.get('orderbooks', {})
+            # Get display data (uses persistent storage)
+            display_data = self.data_manager.get_display_data()
+            instruments = display_data.get('instruments', {})
+            orderbooks = display_data.get('orderbooks', {})
             
-            logger.debug(f"Updating market data table with {len(instruments)} instruments, {len(orderbooks)} orderbooks")
+            # Group and sort instruments
+            sorted_instruments = self._sort_instruments_for_display(instruments)
             
             # Populate table
-            for instrument_name, instrument in instruments.items():
+            for instrument_name, instrument in sorted_instruments:
                 try:
                     orderbook = orderbooks.get(instrument_name)
                     
                     if orderbook:
-                        # Safely get values
                         best_bid = self._safe_float(orderbook.best_bid)
                         best_ask = self._safe_float(orderbook.best_ask)
                         mid_price = (best_bid + best_ask) / 2 if (best_bid > 0 and best_ask > 0) else 0
                         
+                        # Show data age
+                        data_age = self.data_manager.get_data_age(instrument_name)
+                        age_str = f"{data_age:.0f}s" if data_age < 3600 else "old"
+                        
                         values = (
                             str(instrument_name),
-                            self._safe_format_number(instrument.strike, 0),  # No decimals for strike
+                            self._safe_format_number(instrument.strike, 0),
                             str(instrument.option_type).upper(),
                             instrument.expiration.strftime('%Y-%m-%d') if hasattr(instrument.expiration, 'strftime') else "N/A",
                             self._safe_format_number(best_bid, 4),
                             self._safe_format_number(best_ask, 4),
                             self._safe_format_number(mid_price, 4),
-                            orderbook.timestamp.strftime('%H:%M:%S') if hasattr(orderbook.timestamp, 'strftime') else "N/A"
+                            f"{orderbook.timestamp.strftime('%H:%M:%S')} ({age_str})" if hasattr(orderbook.timestamp, 'strftime') else "N/A"
                         )
                         self.market_tree.insert('', 'end', values=values)
                         
@@ -263,20 +267,27 @@ class MarketDataGUI:
             logger.error(f"Error updating market data table: {e}")
                 
     def update_pricing_table(self):
-        """Update pricing analysis table"""
+        """Update pricing analysis table with sorted display"""
         try:
             # Clear existing items
             for item in self.pricing_tree.get_children():
                 self.pricing_tree.delete(item)
                 
-            # Get pricing results
-            pricing_results = self.pricer.calculate_all()
+            # Get display data
+            display_data = self.data_manager.get_display_data()
+            pricing_results = display_data.get('pricing', {})
+            instruments = display_data.get('instruments', {})
             
-            logger.debug(f"Updating pricing table with {len(pricing_results)} results")
+            # Sort instruments for display
+            sorted_instruments = self._sort_instruments_for_display(instruments)
             
-            # Populate table
-            for instrument_name, result in pricing_results.items():
+            # Populate table with sorted data
+            for instrument_name, instrument in sorted_instruments:
                 try:
+                    result = pricing_results.get(instrument_name)
+                    if not result:
+                        continue
+                        
                     values = (
                         str(instrument_name),
                         self._safe_format_number(result.get('market_price'), 4),
@@ -348,3 +359,28 @@ class MarketDataGUI:
         """Close the GUI"""
         self.root.quit()
         self.root.destroy()
+
+    def _sort_instruments_for_display(self, instruments: dict) -> list[tuple]:
+        """Sort instruments by expiry, then strike, then calls before puts"""
+        try:
+            instrument_list = list(instruments.items())
+            
+            def sort_key(item):
+                instrument_name, instrument = item
+                
+                # Extract sorting criteria
+                expiry = getattr(instrument, 'expiration', datetime.now()).timestamp()
+                strike = float(getattr(instrument, 'strike', 0))
+                option_type = getattr(instrument, 'option_type', 'call').lower()
+                
+                # Sort by: expiry, strike, then calls before puts
+                type_order = 0 if option_type == 'call' else 1
+                
+                return (expiry, strike, type_order)
+            
+            sorted_list = sorted(instrument_list, key=sort_key)
+            return sorted_list
+            
+        except Exception as e:
+            logger.error(f"Error sorting instruments: {e}")
+            return list(instruments.items())

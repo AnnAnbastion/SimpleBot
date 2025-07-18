@@ -78,31 +78,31 @@ class TradingApplication:
         logger.info("Starting data update loop (100ms intervals)...")
         iteration = 0
         
+        # Use cached instruments list (calculated only once)
+        instruments_to_update = self.deribit_client.get_cached_instruments()
+        
         while self.running:
             try:
                 iteration += 1
                 
-                # Get fresh orderbook data for a subset of instruments each iteration
-                # This prevents overwhelming the API while keeping data fresh
-                instruments_per_batch = 5  # Update 5 instruments per 100ms cycle
-                start_idx = (iteration * instruments_per_batch) % len(self.selected_instruments)
-                end_idx = min(start_idx + instruments_per_batch, len(self.selected_instruments))
+                # Update orderbooks in batches (using cached instrument list)
+                instruments_per_batch = 5
+                start_idx = (iteration * instruments_per_batch) % len(instruments_to_update)
+                end_idx = min(start_idx + instruments_per_batch, len(instruments_to_update))
                 
-                batch_instruments = self.selected_instruments[start_idx:end_idx]
-                
-                # Update orderbooks for this batch
+                batch_instruments = instruments_to_update[start_idx:end_idx]
                 await self.update_orderbook_batch(batch_instruments)
                 
-                # Also update BTC spot price every 10 iterations (1 second)
+                # Update BTC spot price every 10 iterations
                 if iteration % 10 == 0:
                     await self.update_spot_price()
                 
                 # Log progress occasionally
-                if iteration % 100 == 0:  # Every 10 seconds
-                    market_data = self.data_manager.get_all_market_data()
-                    active_obs = sum(1 for ob in market_data.get('orderbooks', {}).values() 
-                                   if hasattr(ob, 'best_bid') and float(getattr(ob, 'best_bid', 0)) > 0)
-                    logger.info(f"Data update cycle {iteration}: {active_obs} active orderbooks")
+                if iteration % 100 == 0:
+                    display_data = self.data_manager.get_display_data()
+                    active_obs = len(display_data.get('orderbooks', {}))
+                    active_pricing = len(display_data.get('pricing', {}))
+                    logger.info(f"Data cycle {iteration}: {active_obs} orderbooks, {active_pricing} priced instruments")
                 
                 await asyncio.sleep(0.1)  # 100ms
                 

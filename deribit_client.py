@@ -18,6 +18,11 @@ class DeribitClient:
         self.pending_requests = {}  # Track pending requests
         self.max_subscriptions = 50  # Increase limit
         
+        # Cache selected instruments (calculate only once)
+        self.selected_instruments = []
+        self.instruments_calculated = False
+        self.btc_spot_price = None
+        
     async def connect(self):
         """Connect to Deribit WebSocket"""
         try:
@@ -74,41 +79,77 @@ class DeribitClient:
     async def _get_real_btc_spot_price(self) -> float:
         """Get real-time BTC spot price from Deribit"""
         try:
-            # Try to get BTC index price
-            response = await self._send_request("public/get_index", {
-                "currency": "BTC"
-            })
+            logger.info("Getting real BTC spot price...")
             
-            if "result" in response:
-                btc_data = response["result"]
-                spot_price = float(btc_data.get("BTC", 0))
-                if spot_price > 0:
-                    logger.info(f"Real BTC spot price: ${spot_price:,.2f}")
-                    self.data_manager.update_spot_price(spot_price)
-                    return spot_price
+            # Method 1: Try get_index
+            try:
+                response = await self._send_request("public/get_index", {
+                    "currency": "BTC"
+                })
+                
+                if "result" in response:
+                    btc_data = response["result"]
+                    spot_price = float(btc_data.get("BTC", 0))
+                    
+                    # Validate price range (should be reasonable for BTC)
+                    if 10000 <= spot_price <= 200000:  # Reasonable BTC price range
+                        logger.info(f"BTC spot price from index: ${spot_price:,.2f}")
+                        self.data_manager.update_spot_price(spot_price)
+                        return spot_price
+                    else:
+                        logger.warning(f"BTC price from index seems invalid: ${spot_price:,.2f}")
+            except Exception as e:
+                logger.warning(f"Failed to get index price: {e}")
             
-            # Fallback: try perpetual future
-            response2 = await self._send_request("public/get_book_summary_by_currency", {
-                "currency": "BTC",
-                "kind": "future"
-            })
+            # Method 2: Try BTC-PERPETUAL future
+            try:
+                response = await self._send_request("public/get_order_book", {
+                    "instrument_name": "BTC-PERPETUAL"
+                })
+                
+                if "result" in response:
+                    result = response["result"]
+                    mark_price = float(result.get("mark_price", 0))
+                    
+                    if 10000 <= mark_price <= 200000:
+                        logger.info(f"BTC spot price from perpetual: ${mark_price:,.2f}")
+                        self.data_manager.update_spot_price(mark_price)
+                        return mark_price
+                    else:
+                        logger.warning(f"BTC price from perpetual seems invalid: ${mark_price:,.2f}")
+            except Exception as e:
+                logger.warning(f"Failed to get perpetual price: {e}")
             
-            if "result" in response2 and response2["result"]:
-                futures = response2["result"]
-                for future in futures:
-                    if "PERPETUAL" in future.get("instrument_name", ""):
-                        mark_price = float(future.get("mark_price", 0))
-                        if mark_price > 0:
-                            logger.info(f"BTC price from perpetual: ${mark_price:,.2f}")
-                            self.data_manager.update_spot_price(mark_price)
-                            return mark_price
+            # Method 3: Try ticker for BTC-PERPETUAL
+            try:
+                response = await self._send_request("public/ticker", {
+                    "instrument_name": "BTC-PERPETUAL"
+                })
+                
+                if "result" in response:
+                    result = response["result"]
+                    last_price = float(result.get("last_price", 0))
+                    
+                    if 10000 <= last_price <= 200000:
+                        logger.info(f"BTC spot price from ticker: ${last_price:,.2f}")
+                        self.data_manager.update_spot_price(last_price)
+                        return last_price
+                    else:
+                        logger.warning(f"BTC price from ticker seems invalid: ${last_price:,.2f}")
+            except Exception as e:
+                logger.warning(f"Failed to get ticker price: {e}")
             
-            logger.warning("Could not get real BTC price, using fallback")
-            return 50000  # Fallback
+            # Fallback: Use a reasonable current estimate
+            fallback_price = 95000  # Update this to current BTC price range
+            logger.warning(f"Using fallback BTC price: ${fallback_price:,.2f}")
+            self.data_manager.update_spot_price(fallback_price)
+            return fallback_price
             
         except Exception as e:
             logger.error(f"Error getting BTC spot price: {e}")
-            return 50000
+            fallback_price = 95000
+            self.data_manager.update_spot_price(fallback_price)
+            return fallback_price
 
     def _select_best_expiries(self, instruments: List[Dict]) -> List[Dict]:
         """Select best expiries: some short-term, some long-term"""
@@ -139,17 +180,17 @@ class DeribitClient:
             # Selection strategy
             selected = []
             
-            # 1. Short-term: 1-2 expiries within 30 days
+            # 1. Short-term: 1-3 expiries within 30 days
             short_term = [exp for exp in expiry_list if exp['days_to_expiry'] <= 30]
             if short_term:
                 selected.extend(short_term[:3])
                 
-            # 2. Medium-term: 1-2 expiries between 30-90 days
+            # 2. Medium-term: 1-3 expiries between 30-90 days
             medium_term = [exp for exp in expiry_list if 30 < exp['days_to_expiry'] <= 90]
             if medium_term:
                 selected.extend(medium_term[:3])
                 
-            # 3. Long-term: 1 expiry beyond 90 days
+            # 3. Long-term: 1-3 expiry beyond 90 days
             long_term = [exp for exp in expiry_list if exp['days_to_expiry'] > 90]
             if long_term:
                 selected.extend(long_term[:3])
@@ -160,7 +201,7 @@ class DeribitClient:
                     if exp not in selected and len(selected) < 9:
                         selected.append(exp)
                         
-            return selected[:6]  # Maximum 5 expiries
+            return selected[:6]  # Maximum 6 expiries
             
         except Exception as e:
             logger.error(f"Error selecting expiries: {e}")
@@ -203,7 +244,7 @@ class DeribitClient:
             return expiry_instruments[:20]  # Fallback
 
     def _select_best_instruments(self, all_instruments: List[Dict], spot_price: float) -> List[Dict]:
-        """Select the most relevant instruments with 10 strikes per expiry"""
+        """Select the most relevant instruments with strikes per expiry"""
         try:
             current_time = datetime.now().timestamp() * 1000
             
@@ -246,7 +287,7 @@ class DeribitClient:
             selected_expiries = self._select_best_expiries(valid_instruments)
             logger.info(f"Selected {len(selected_expiries)} expiries")
             
-            # For each selected expiry, get 10 strikes around ATM
+            # For each selected expiry, get strikes around ATM
             selected_instruments = []
             
             for expiry_info in selected_expiries:
@@ -260,13 +301,52 @@ class DeribitClient:
         except Exception as e:
             logger.error(f"Error selecting instruments: {e}")
             return all_instruments[:self.max_subscriptions]
+
+    def _log_selected_instruments(self):
+        """Log the selected instruments by expiry and strike"""
+        try:
+            by_expiry = {}
+            for inst in self.selected_instruments:
+                expiry = inst.get('expiration_timestamp', 0)
+                if expiry not in by_expiry:
+                    exp_date = datetime.fromtimestamp(expiry / 1000)
+                    by_expiry[expiry] = {
+                        'name': exp_date.strftime('%d%b%y').upper(),
+                        'calls': [],
+                        'puts': []
+                    }
+                
+                strike = inst.get('strike', 0)
+                option_type = inst.get('option_type', '').lower()
+                
+                if option_type == 'call':
+                    by_expiry[expiry]['calls'].append(strike)
+                else:
+                    by_expiry[expiry]['puts'].append(strike)
+            
+            logger.info("Selected instruments by expiry:")
+            for expiry_data in by_expiry.values():
+                calls = sorted(expiry_data['calls'])
+                puts = sorted(expiry_data['puts'])
+                logger.info(f"  {expiry_data['name']}: {len(calls)} calls, {len(puts)} puts")
+                if calls:
+                    logger.info(f"    Call strikes: {calls[:3]}...{calls[-3:] if len(calls) > 3 else []}")
+                if puts:
+                    logger.info(f"    Put strikes: {puts[:3]}...{puts[-3:] if len(puts) > 3 else []}")
+                
+        except Exception as e:
+            logger.error(f"Error logging instruments: {e}")
         
     async def get_btc_instruments(self) -> List[Dict]:
-        """Get all BTC instruments"""
-        logger.info("Requesting BTC instruments...")
+        """Get BTC instruments (calculate selection only once)"""
+        if self.instruments_calculated and self.selected_instruments:
+            logger.info(f"Using cached instruments: {len(self.selected_instruments)} instruments")
+            return self.selected_instruments
+            
+        logger.info("Calculating instrument selection (first time only)...")
         
-        # First get the real BTC spot price
-        spot_price = await self._get_real_btc_spot_price()
+        # Get real BTC spot price first
+        self.btc_spot_price = await self._get_real_btc_spot_price()
         
         response = await self._send_request("public/get_instruments", {
             "currency": "BTC",
@@ -277,15 +357,24 @@ class DeribitClient:
             all_instruments = response["result"]
             logger.info(f"Received {len(all_instruments)} total BTC instruments")
             
-            # Filter and select the best instruments using real spot price
-            selected_instruments = self._select_best_instruments(all_instruments, spot_price)
-            logger.info(f"Selected {len(selected_instruments)} instruments for trading")
+            # Calculate best selection once
+            self.selected_instruments = self._select_best_instruments(all_instruments, self.btc_spot_price)
+            self.instruments_calculated = True
             
-            self.data_manager.update_instruments(selected_instruments)
-            return selected_instruments
+            logger.info(f"Selected {len(self.selected_instruments)} instruments (cached for future use)")
+            
+            # Show what we selected
+            self._log_selected_instruments()
+            
+            self.data_manager.update_instruments(self.selected_instruments)
+            return self.selected_instruments
         else:
             logger.error("Failed to get instruments")
             return []
+
+    def get_cached_instruments(self) -> List[Dict]:
+        """Get the cached selected instruments"""
+        return self.selected_instruments
 
     async def _get_initial_orderbooks(self, instruments: List[Dict]):
         """Get initial order book snapshots for all instruments"""

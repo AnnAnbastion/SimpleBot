@@ -202,47 +202,57 @@ class OptionsPricer:
             instruments = market_data.get('instruments', {})
             orderbooks = market_data.get('orderbooks', {})
             
-            logger.debug(f"Processing {len(instruments)} instruments with {len(orderbooks)} orderbooks")
-            
             for instrument_name, instrument in instruments.items():
                 try:
                     orderbook = orderbooks.get(instrument_name)
                     
                     if not orderbook:
-                        logger.debug(f"No orderbook for {instrument_name}")
                         continue
                         
-                    # Check if we have valid bid/ask data
                     best_bid = self._safe_float(orderbook.best_bid)
                     best_ask = self._safe_float(orderbook.best_ask)
                     
                     if best_bid <= 0 or best_ask <= 0:
-                        logger.debug(f"Invalid bid/ask for {instrument_name}: bid={best_bid}, ask={best_ask}")
                         continue
-                        
-                    # Calculate time to expiration
-                    time_to_expiry = self._safe_time_to_expiry(instrument.expiration)
                     
+                    # Additional validation: check for reasonable bid-ask spread
+                    spread = best_ask - best_bid
+                    mid_price = (best_bid + best_ask) / 2
+                    
+                    if spread <= 0 or spread > mid_price:  # Spread can't be larger than price
+                        logger.debug(f"Invalid spread for {instrument_name}: bid={best_bid}, ask={best_ask}")
+                        continue
+                    
+                    time_to_expiry = self._safe_time_to_expiry(instrument.expiration)
                     if time_to_expiry <= 0:
-                        logger.debug(f"Expired instrument: {instrument_name}")
                         continue
                         
-                    # Market data
-                    market_price = (best_bid + best_ask) / 2
+                    market_price = mid_price
                     strike = self._safe_float(instrument.strike)
                     
                     if strike <= 0:
-                        logger.debug(f"Invalid strike for {instrument_name}: {strike}")
                         continue
-                        
-                    # Calculate implied volatility
+                    
+                    # Validation: Market price should be reasonable relative to intrinsic value
+                    if instrument.option_type.lower() == 'call':
+                        intrinsic = max(spot_price - strike, 0)
+                    else:
+                        intrinsic = max(strike - spot_price, 0)
+                    
+                    # Market price shouldn't be less than intrinsic or more than 10x intrinsic + $10000
+                    max_reasonable_price = max(intrinsic + 10000, spot_price * 0.5)
+                    if market_price > max_reasonable_price:
+                        logger.debug(f"Unreasonable market price for {instrument_name}: ${market_price} vs max ${max_reasonable_price}")
+                        continue
+                    
+                    # Calculate implied volatility with bounds
                     implied_vol = self.calculate_implied_volatility(
                         market_price, spot_price, strike, 
                         time_to_expiry, self.risk_free_rate, instrument.option_type
                     )
                     
-                    if implied_vol is None or implied_vol <= 0:
-                        logger.debug(f"Could not calculate IV for {instrument_name}")
+                    if implied_vol is None or implied_vol <= 0 or implied_vol > 10:  # IV > 1000% is unreasonable
+                        logger.debug(f"Unreasonable IV for {instrument_name}: {implied_vol}")
                         continue
                         
                     # Calculate theoretical price and Greeks
@@ -250,6 +260,11 @@ class OptionsPricer:
                         spot_price, strike, time_to_expiry,
                         self.risk_free_rate, implied_vol, instrument.option_type
                     )
+                    
+                    # Final validation
+                    if theoretical_price > max_reasonable_price:
+                        logger.debug(f"Unreasonable theoretical price for {instrument_name}: ${theoretical_price}")
+                        continue
                     
                     greeks = self.calculate_greeks(
                         spot_price, strike, time_to_expiry,
@@ -267,12 +282,13 @@ class OptionsPricer:
                         'theoretical_price': theoretical_price,
                         'implied_volatility': implied_vol,
                         'price_diff': market_price - theoretical_price,
+                        'intrinsic_value': intrinsic,
                         **greeks,
                         'timestamp': datetime.now()
                     }
                     
                 except Exception as e:
-                    logger.error(f"Error processing instrument {instrument_name}: {e}")
+                    logger.debug(f"Error processing instrument {instrument_name}: {e}")
                     continue
                     
             logger.debug(f"Successfully calculated pricing for {len(results)} instruments")
@@ -280,8 +296,6 @@ class OptionsPricer:
             
         except Exception as e:
             logger.error(f"Error in calculate_all: {e}")
-            import traceback
-            traceback.print_exc()
             return {}
     
     # Add this method to your OptionsPricer class in pricer.py
