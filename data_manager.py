@@ -57,6 +57,14 @@ class Instrument:
     tick_size: float
     min_trade_amount: float
 
+@dataclass
+class Future:
+    instrument_name: str
+    expiration: datetime
+    contract_size: float
+    tick_size: float
+    min_trade_amount: float
+
 class DataManager:
     def __init__(self):
         self._lock = threading.RLock()
@@ -70,6 +78,10 @@ class DataManager:
         self._update_count: int = 0
         self._latest_pricing_results: Dict = {}
         self._last_pricing_update: datetime = datetime.now()
+        # Add futures storage
+        self._futures: Dict[str, Future] = {}
+        self._futures_orderbooks: Dict[str, OrderBook] = {}
+        self._persistent_futures_orderbooks: Dict[str, OrderBook] = {}
         
     def _safe_float(self, value, default=0.0) -> float:
         """Safely convert value to float"""
@@ -277,3 +289,6 @@ class DataManager:
         except (ValueError, TypeError) as e:
             logger.warning(f"Could not parse expiration timestamp {timestamp}: {e}")
             return datetime.now()
+        
+
+        
