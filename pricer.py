@@ -1,11 +1,31 @@
 # pricer.py
 import numpy as np
-from scipy.stats import norm
 from datetime import datetime
 from typing import Dict, Optional, Union
 import logging
 
+# Set up logger first
 logger = logging.getLogger(__name__)
+
+# Try to import professional libraries
+try:
+    from py_vollib.black_scholes import black_scholes
+    from py_vollib.black_scholes.greeks.analytical import delta, gamma, theta, vega, rho
+    from py_vollib.black_scholes.implied_volatility import implied_volatility
+    VOLLIB_AVAILABLE = True
+    logger.info("py_vollib library available")
+except ImportError as e:
+    VOLLIB_AVAILABLE = False
+    logger.warning(f"py_vollib not available: {e}, using fallback implementation")
+
+# Always import scipy as fallback
+from scipy.stats import norm
+try:
+    from scipy.optimize import brentq
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    logger.warning("scipy.optimize not available")
 
 class OptionsPricer:
     def __init__(self, data_manager):
@@ -26,168 +46,254 @@ class OptionsPricer:
         return default
         
     def _safe_time_to_expiry(self, expiration) -> float:
-        """Safely calculate time to expiry"""
+        """Safely calculate time to expiry in years"""
         try:
             if isinstance(expiration, datetime):
                 now = datetime.now()
                 time_diff = (expiration - now).total_seconds()
-                return max(time_diff / (365.25 * 24 * 3600), 0.0001)  # Minimum 1 hour
+                years = time_diff / (365.25 * 24 * 3600)
+                return max(years, 1/365)  # Minimum 1 day
             else:
                 logger.warning(f"Invalid expiration type: {type(expiration)}")
-                return 0.0001
+                return 1/365
         except Exception as e:
             logger.error(f"Error calculating time to expiry: {e}")
-            return 0.0001
-        
-    def black_scholes_price(self, S: float, K: float, T: float, r: float, 
-                           sigma: float, option_type: str) -> float:
-        """Calculate Black-Scholes option price with error handling"""
+            return 1/365
+
+    def calculate_implied_volatility(self, market_price: float, S: float, K: float, 
+                                   T: float, r: float, option_type: str) -> Optional[float]:
+        """Calculate IV using best available method"""
         try:
-            # Convert all inputs to safe floats
+            # Input validation
             S = self._safe_float(S)
             K = self._safe_float(K)
             T = self._safe_float(T)
             r = self._safe_float(r)
-            sigma = self._safe_float(sigma, 0.3)  # Default 30% vol
+            market_price = self._safe_float(market_price)
             
-            # Validate inputs
-            if S <= 0 or K <= 0 or sigma <= 0:
-                return 0.0
-                
-            if T <= 0:
-                # Handle expired options
-                if option_type.lower() == 'call':
-                    return max(S - K, 0)
-                else:
-                    return max(K - S, 0)
-                    
-            # Calculate d1 and d2
-            d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-            d2 = d1 - sigma * np.sqrt(T)
+            if T <= 0 or market_price <= 0 or S <= 0 or K <= 0:
+                return None
             
+            # Check intrinsic value bounds
             if option_type.lower() == 'call':
-                price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-            else:  # put
-                price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+                intrinsic = max(S - K, 0)
+            else:
+                intrinsic = max(K - S, 0)
+            
+            # Market price must be at least intrinsic value (with small tolerance)
+            if market_price < intrinsic * 0.95:
+                logger.debug(f"Market price {market_price} below intrinsic {intrinsic}")
+                return None
+            
+            # Try py_vollib first if available
+            if VOLLIB_AVAILABLE:
+                try:
+                    flag = 'c' if option_type.lower() == 'call' else 'p'
+                    iv = implied_volatility(market_price, S, K, T, r, flag)
+                    
+                    if 0.001 <= iv <= 10:  # Between 0.1% and 1000%
+                        return iv
+                except Exception as e:
+                    logger.debug(f"py_vollib IV failed: {e}")
+            
+            # Fallback to Brent's method
+            if SCIPY_AVAILABLE:
+                return self._calculate_iv_brent(market_price, S, K, T, r, option_type)
+            else:
+                return self._calculate_iv_bisection(market_price, S, K, T, r, option_type)
                 
-            return max(price, 0)
+        except Exception as e:
+            logger.debug(f"Error in IV calculation: {e}")
+            return None
+
+    def _calculate_iv_brent(self, market_price: float, S: float, K: float, 
+                           T: float, r: float, option_type: str) -> Optional[float]:
+        """Calculate IV using Brent's method"""
+        try:
+            def price_diff(vol):
+                try:
+                    bs_price = self._black_scholes_fallback(S, K, T, r, vol, option_type)
+                    return bs_price - market_price
+                except:
+                    return float('inf')
+            
+            # Try to find IV between 0.1% and 500%
+            iv = brentq(price_diff, 0.001, 5.0, xtol=1e-6, maxiter=100)
+            return iv if 0.001 <= iv <= 5.0 else None
+                
+        except Exception as e:
+            logger.debug(f"Brent IV calculation failed: {e}")
+            return None
+
+    def _calculate_iv_bisection(self, market_price: float, S: float, K: float, 
+                               T: float, r: float, option_type: str) -> Optional[float]:
+        """Simple bisection method for IV calculation"""
+        try:
+            low_vol = 0.001
+            high_vol = 5.0
+            
+            for _ in range(50):  # Max iterations
+                mid_vol = (low_vol + high_vol) / 2
+                
+                bs_price = self._black_scholes_fallback(S, K, T, r, mid_vol, option_type)
+                
+                if abs(bs_price - market_price) < 1e-6:
+                    return mid_vol
+                
+                if bs_price > market_price:
+                    high_vol = mid_vol
+                else:
+                    low_vol = mid_vol
+                    
+                if abs(high_vol - low_vol) < 1e-6:
+                    break
+            
+            return (low_vol + high_vol) / 2
             
         except Exception as e:
-            logger.error(f"Error in black_scholes_price: {e}")
-            return 0.0
-        
-    def calculate_greeks(self, S: float, K: float, T: float, r: float, 
-                        sigma: float, option_type: str) -> Dict[str, float]:
-        """Calculate option Greeks with error handling"""
+            logger.debug(f"Bisection IV calculation failed: {e}")
+            return None
+
+    def _black_scholes_price(self, S: float, K: float, T: float, r: float, 
+                            sigma: float, option_type: str) -> float:
+        """Calculate BS price - works with both libraries and fallback"""
         try:
-            # Convert all inputs to safe floats
+            # Try py_vollib first
+            if VOLLIB_AVAILABLE:
+                try:
+                    flag = 'c' if option_type.lower() == 'call' else 'p'
+                    price = black_scholes(flag, S, K, T, r, sigma)
+                    return max(price, 0.0)
+                except Exception as e:
+                    logger.debug(f"py_vollib BS failed: {e}")
+            
+            # Fallback implementation
+            return self._black_scholes_fallback(S, K, T, r, sigma, option_type)
+            
+        except Exception as e:
+            logger.error(f"Error in BS price calculation: {e}")
+            return 0.0
+
+    def _black_scholes_fallback(self, S: float, K: float, T: float, r: float, 
+                               sigma: float, option_type: str) -> float:
+        """Fallback BS implementation using scipy"""
+        try:
             S = self._safe_float(S)
             K = self._safe_float(K)
             T = self._safe_float(T)
             r = self._safe_float(r)
             sigma = self._safe_float(sigma, 0.3)
             
-            # Default Greeks for invalid inputs
-            default_greeks = {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0, 'rho': 0}
+            if S <= 0 or K <= 0 or sigma <= 0:
+                return 0.0
+                
+            if T <= 0:
+                if option_type.lower() == 'call':
+                    return max(S - K, 0)
+                else:
+                    return max(K - S, 0)
+            
+            d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+            d2 = d1 - sigma * np.sqrt(T)
+            
+            if option_type.lower() == 'call':
+                price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+            else:
+                price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+                
+            return max(price, 0)
+            
+        except Exception as e:
+            logger.error(f"Error in fallback BS price: {e}")
+            return 0.0
+
+    def _calculate_greeks(self, S: float, K: float, T: float, r: float, 
+                         sigma: float, option_type: str) -> Dict[str, float]:
+        """Calculate Greeks using best available method"""
+        try:
+            # Input validation
+            S = self._safe_float(S)
+            K = self._safe_float(K)
+            T = self._safe_float(T)
+            r = self._safe_float(r)
+            sigma = self._safe_float(sigma, 0.3)
             
             if S <= 0 or K <= 0 or sigma <= 0 or T <= 0:
-                return default_greeks
-                
+                return {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0, 'rho': 0}
+            
+            # Try py_vollib first
+            if VOLLIB_AVAILABLE:
+                try:
+                    flag = 'c' if option_type.lower() == 'call' else 'p'
+                    
+                    delta_val = delta(flag, S, K, T, r, sigma)
+                    gamma_val = gamma(flag, S, K, T, r, sigma)
+                    theta_val = theta(flag, S, K, T, r, sigma) / 365  # Daily theta
+                    vega_val = vega(flag, S, K, T, r, sigma) / 100   # 1% vol change
+                    rho_val = rho(flag, S, K, T, r, sigma) / 100     # 1% rate change
+                    
+                    return {
+                        'delta': self._safe_float(delta_val),
+                        'gamma': self._safe_float(gamma_val),
+                        'theta': self._safe_float(theta_val),
+                        'vega': self._safe_float(vega_val),
+                        'rho': self._safe_float(rho_val)
+                    }
+                except Exception as e:
+                    logger.debug(f"py_vollib Greeks failed: {e}")
+            
+            # Fallback Greeks calculation
+            return self._calculate_greeks_fallback(S, K, T, r, sigma, option_type)
+            
+        except Exception as e:
+            logger.error(f"Error calculating Greeks: {e}")
+            return {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0, 'rho': 0}
+
+    def _calculate_greeks_fallback(self, S: float, K: float, T: float, r: float, 
+                                  sigma: float, option_type: str) -> Dict[str, float]:
+        """Fallback Greeks calculation"""
+        try:
             d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
             d2 = d1 - sigma * np.sqrt(T)
             
             # Delta
             if option_type.lower() == 'call':
-                delta = norm.cdf(d1)
+                delta_val = norm.cdf(d1)
             else:
-                delta = norm.cdf(d1) - 1
+                delta_val = norm.cdf(d1) - 1
                 
             # Gamma (same for calls and puts)
-            gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
+            gamma_val = norm.pdf(d1) / (S * sigma * np.sqrt(T))
             
             # Theta
             theta_part1 = -(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T))
             if option_type.lower() == 'call':
-                theta = theta_part1 - r * K * np.exp(-r * T) * norm.cdf(d2)
+                theta_val = theta_part1 - r * K * np.exp(-r * T) * norm.cdf(d2)
             else:
-                theta = theta_part1 + r * K * np.exp(-r * T) * norm.cdf(-d2)
-            theta = theta / 365  # Convert to daily theta
+                theta_val = theta_part1 + r * K * np.exp(-r * T) * norm.cdf(-d2)
+            theta_val = theta_val / 365  # Convert to daily theta
             
             # Vega (same for calls and puts)
-            vega = S * norm.pdf(d1) * np.sqrt(T) / 100  # Per 1% vol change
+            vega_val = S * norm.pdf(d1) * np.sqrt(T) / 100  # Per 1% vol change
             
             # Rho
             if option_type.lower() == 'call':
-                rho = K * T * np.exp(-r * T) * norm.cdf(d2) / 100
+                rho_val = K * T * np.exp(-r * T) * norm.cdf(d2) / 100
             else:
-                rho = -K * T * np.exp(-r * T) * norm.cdf(-d2) / 100
+                rho_val = -K * T * np.exp(-r * T) * norm.cdf(-d2) / 100
                 
             return {
-                'delta': self._safe_float(delta),
-                'gamma': self._safe_float(gamma),
-                'theta': self._safe_float(theta),
-                'vega': self._safe_float(vega),
-                'rho': self._safe_float(rho)
+                'delta': self._safe_float(delta_val),
+                'gamma': self._safe_float(gamma_val),
+                'theta': self._safe_float(theta_val),
+                'vega': self._safe_float(vega_val),
+                'rho': self._safe_float(rho_val)
             }
             
         except Exception as e:
-            logger.error(f"Error calculating Greeks: {e}")
+            logger.error(f"Error in fallback Greeks: {e}")
             return {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0, 'rho': 0}
-        
-    def calculate_implied_volatility(self, market_price: float, S: float, K: float, 
-                                   T: float, r: float, option_type: str) -> Optional[float]:
-        """Calculate implied volatility using Newton-Raphson method"""
-        try:
-            # Convert inputs to safe floats
-            market_price = self._safe_float(market_price)
-            S = self._safe_float(S)
-            K = self._safe_float(K)
-            T = self._safe_float(T)
-            r = self._safe_float(r)
-            
-            if T <= 0 or market_price <= 0 or S <= 0 or K <= 0:
-                return None
-                
-            # Initial guess
-            sigma = 0.3
-            
-            for iteration in range(50):  # Reduced iterations
-                try:
-                    price = self.black_scholes_price(S, K, T, r, sigma, option_type)
-                    greeks = self.calculate_greeks(S, K, T, r, sigma, option_type)
-                    vega = greeks['vega'] * 100  # Convert to per unit vol change
-                    
-                    if abs(vega) < 1e-6:
-                        break
-                        
-                    diff = market_price - price
-                    if abs(diff) < 1e-6:
-                        return sigma
-                        
-                    sigma_new = sigma + diff / vega if vega != 0 else sigma
-                    
-                    # Bounds checking
-                    if sigma_new <= 0.001:
-                        sigma_new = 0.001
-                    elif sigma_new > 10:
-                        sigma_new = 10
-                        
-                    # Check for convergence
-                    if abs(sigma_new - sigma) < 1e-6:
-                        break
-                        
-                    sigma = sigma_new
-                    
-                except Exception as e:
-                    logger.warning(f"Error in IV iteration {iteration}: {e}")
-                    break
-                    
-            return sigma if 0.001 <= sigma <= 10 else None
-            
-        except Exception as e:
-            logger.error(f"Error calculating implied volatility: {e}")
-            return None
-        
+
     def calculate_all(self) -> Dict:
         """Calculate pricing and risk metrics for all instruments"""
         try:
@@ -202,75 +308,72 @@ class OptionsPricer:
             instruments = market_data.get('instruments', {})
             orderbooks = market_data.get('orderbooks', {})
             
+            logger.debug(f"Processing {len(instruments)} instruments with {len(orderbooks)} orderbooks")
+            
             for instrument_name, instrument in instruments.items():
                 try:
+                    # Get orderbook data
                     orderbook = orderbooks.get(instrument_name)
-                    
                     if not orderbook:
                         continue
                         
                     best_bid = self._safe_float(orderbook.best_bid)
                     best_ask = self._safe_float(orderbook.best_ask)
                     
+                    # Check if we have valid bid/ask
                     if best_bid <= 0 or best_ask <= 0:
                         continue
                     
-                    # Additional validation: check for reasonable bid-ask spread
+                    # Check for reasonable spread
                     spread = best_ask - best_bid
                     mid_price = (best_bid + best_ask) / 2
                     
-                    if spread <= 0 or spread > mid_price:  # Spread can't be larger than price
-                        logger.debug(f"Invalid spread for {instrument_name}: bid={best_bid}, ask={best_ask}")
+                    if spread <= 0:
                         continue
                     
+                    # Basic instrument data
                     time_to_expiry = self._safe_time_to_expiry(instrument.expiration)
                     if time_to_expiry <= 0:
                         continue
                         
-                    market_price = mid_price
                     strike = self._safe_float(instrument.strike)
-                    
                     if strike <= 0:
                         continue
                     
-                    # Validation: Market price should be reasonable relative to intrinsic value
+                    market_price = mid_price
+                    
+                    # Calculate intrinsic value
                     if instrument.option_type.lower() == 'call':
                         intrinsic = max(spot_price - strike, 0)
                     else:
                         intrinsic = max(strike - spot_price, 0)
                     
-                    # Market price shouldn't be less than intrinsic or more than 10x intrinsic + $10000
-                    max_reasonable_price = max(intrinsic + 10000, spot_price * 0.5)
-                    if market_price > max_reasonable_price:
-                        logger.debug(f"Unreasonable market price for {instrument_name}: ${market_price} vs max ${max_reasonable_price}")
+                    # Basic validation - market price should be reasonable
+                    if market_price < intrinsic * 0.9:
                         continue
                     
-                    # Calculate implied volatility with bounds
+                    # Calculate IV
                     implied_vol = self.calculate_implied_volatility(
                         market_price, spot_price, strike, 
                         time_to_expiry, self.risk_free_rate, instrument.option_type
                     )
                     
-                    if implied_vol is None or implied_vol <= 0 or implied_vol > 10:  # IV > 1000% is unreasonable
-                        logger.debug(f"Unreasonable IV for {instrument_name}: {implied_vol}")
+                    if implied_vol is None or implied_vol <= 0 or implied_vol > 5:
                         continue
                         
-                    # Calculate theoretical price and Greeks
-                    theoretical_price = self.black_scholes_price(
+                    # Calculate theoretical price
+                    theoretical_price = self._black_scholes_price(
                         spot_price, strike, time_to_expiry,
                         self.risk_free_rate, implied_vol, instrument.option_type
                     )
                     
-                    # Final validation
-                    if theoretical_price > max_reasonable_price:
-                        logger.debug(f"Unreasonable theoretical price for {instrument_name}: ${theoretical_price}")
-                        continue
-                    
-                    greeks = self.calculate_greeks(
+                    # Calculate Greeks
+                    greeks = self._calculate_greeks(
                         spot_price, strike, time_to_expiry,
                         self.risk_free_rate, implied_vol, instrument.option_type
                     )
                     
+                    # Store results
                     results[instrument_name] = {
                         'spot_price': spot_price,
                         'strike': strike,
@@ -283,22 +386,28 @@ class OptionsPricer:
                         'implied_volatility': implied_vol,
                         'price_diff': market_price - theoretical_price,
                         'intrinsic_value': intrinsic,
+                        'time_value': market_price - intrinsic,
                         **greeks,
                         'timestamp': datetime.now()
                     }
                     
+                    # Debug log for first few successful calculations
+                    if len(results) <= 3:
+                        logger.info(f"Calculated {instrument_name}: Price=${market_price:.2f}, IV={implied_vol:.1%}, Delta={greeks['delta']:.3f}")
+                        
                 except Exception as e:
                     logger.debug(f"Error processing instrument {instrument_name}: {e}")
                     continue
                     
-            logger.debug(f"Successfully calculated pricing for {len(results)} instruments")
+            logger.info(f"Successfully calculated pricing for {len(results)} instruments")
             return results
             
         except Exception as e:
             logger.error(f"Error in calculate_all: {e}")
+            import traceback
+            traceback.print_exc()
             return {}
     
-    # Add this method to your OptionsPricer class in pricer.py
     def get_cached_results(self) -> Dict:
         """Get cached pricing results from data manager"""
         return self.data_manager.get_latest_pricing_results()
