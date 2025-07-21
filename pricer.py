@@ -207,9 +207,10 @@ class OptionsPricer:
             logger.error(f"Error in fallback BS price: {e}")
             return 0.0
 
+    # Replace the _calculate_greeks method in pricer.py
     def _calculate_greeks(self, S: float, K: float, T: float, r: float, 
-                         sigma: float, option_type: str) -> Dict[str, float]:
-        """Calculate Greeks using best available method"""
+                        sigma: float, option_type: str) -> Dict[str, float]:
+        """Calculate Greeks using best available method with enhanced debugging"""
         try:
             # Input validation
             S = self._safe_float(S)
@@ -218,19 +219,30 @@ class OptionsPricer:
             r = self._safe_float(r)
             sigma = self._safe_float(sigma, 0.3)
             
+            logger.debug(f"Greek inputs: S={S}, K={K}, T={T}, r={r}, σ={sigma}, type={option_type}")
+            
             if S <= 0 or K <= 0 or sigma <= 0 or T <= 0:
+                logger.debug("Invalid inputs for Greeks calculation")
                 return {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0, 'rho': 0}
             
             # Try py_vollib first
             if VOLLIB_AVAILABLE:
                 try:
                     flag = 'c' if option_type.lower() == 'call' else 'p'
+                    logger.debug(f"Using py_vollib with flag={flag}")
                     
                     delta_val = delta(flag, S, K, T, r, sigma)
                     gamma_val = gamma(flag, S, K, T, r, sigma)
                     theta_val = theta(flag, S, K, T, r, sigma) / 365  # Daily theta
                     vega_val = vega(flag, S, K, T, r, sigma) / 100   # 1% vol change
                     rho_val = rho(flag, S, K, T, r, sigma) / 100     # 1% rate change
+                    
+                    logger.debug(f"py_vollib Greeks: δ={delta_val:.4f}, γ={gamma_val:.4f}")
+                    
+                    # Validate results
+                    if abs(delta_val) > 1.5:  # Delta should be between -1 and 1
+                        logger.warning(f"Invalid delta from py_vollib: {delta_val}")
+                        raise ValueError("Invalid delta")
                     
                     return {
                         'delta': self._safe_float(delta_val),
@@ -243,6 +255,7 @@ class OptionsPricer:
                     logger.debug(f"py_vollib Greeks failed: {e}")
             
             # Fallback Greeks calculation
+            logger.debug("Using fallback Greeks calculation")
             return self._calculate_greeks_fallback(S, K, T, r, sigma, option_type)
             
         except Exception as e:
@@ -250,11 +263,15 @@ class OptionsPricer:
             return {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0, 'rho': 0}
 
     def _calculate_greeks_fallback(self, S: float, K: float, T: float, r: float, 
-                                  sigma: float, option_type: str) -> Dict[str, float]:
-        """Fallback Greeks calculation"""
+                                sigma: float, option_type: str) -> Dict[str, float]:
+        """Fallback Greeks calculation with debugging"""
         try:
+            logger.debug(f"Fallback Greeks: S={S}, K={K}, T={T}, r={r}, σ={sigma}")
+            
             d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
             d2 = d1 - sigma * np.sqrt(T)
+            
+            logger.debug(f"d1={d1:.4f}, d2={d2:.4f}")
             
             # Delta
             if option_type.lower() == 'call':
@@ -281,6 +298,13 @@ class OptionsPricer:
                 rho_val = K * T * np.exp(-r * T) * norm.cdf(d2) / 100
             else:
                 rho_val = -K * T * np.exp(-r * T) * norm.cdf(-d2) / 100
+            
+            logger.debug(f"Fallback calculated: δ={delta_val:.4f}, γ={gamma_val:.4f}")
+            
+            # Validate results
+            if abs(delta_val) > 1.5:
+                logger.warning(f"Invalid fallback delta: {delta_val}")
+                delta_val = 0.5 if option_type.lower() == 'call' else -0.5
                 
             return {
                 'delta': self._safe_float(delta_val),
@@ -294,27 +318,30 @@ class OptionsPricer:
             logger.error(f"Error in fallback Greeks: {e}")
             return {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0, 'rho': 0}
 
+    # Replace the calculate_all method in pricer.py
     def calculate_all(self) -> Dict:
         """Calculate pricing and risk metrics for all instruments"""
         try:
-            market_data = self.data_manager.get_all_market_data()
-            spot_price = self._safe_float(market_data.get('spot_price', 0))
+            # Use persistent data instead of current data
+            display_data = self.data_manager.get_display_data()  # This uses persistent storage
+            spot_price = self._safe_float(display_data.get('spot_price', 0))
             
             if spot_price <= 0:
                 logger.debug("No valid spot price available")
                 return {}
                 
             results = {}
-            instruments = market_data.get('instruments', {})
-            orderbooks = market_data.get('orderbooks', {})
+            instruments = display_data.get('instruments', {})
+            orderbooks = display_data.get('orderbooks', {})  # This is persistent orderbooks!
             
-            logger.debug(f"Processing {len(instruments)} instruments with {len(orderbooks)} orderbooks")
+            logger.debug(f"Processing {len(instruments)} instruments with {len(orderbooks)} persistent orderbooks")
             
             for instrument_name, instrument in instruments.items():
                 try:
-                    # Get orderbook data
+                    # Get orderbook data from persistent storage
                     orderbook = orderbooks.get(instrument_name)
                     if not orderbook:
+                        logger.debug(f"No persistent orderbook for {instrument_name}")
                         continue
                         
                     best_bid = self._safe_float(orderbook.best_bid)
@@ -322,6 +349,7 @@ class OptionsPricer:
                     
                     # Check if we have valid bid/ask
                     if best_bid <= 0 or best_ask <= 0:
+                        logger.debug(f"Invalid bid/ask for {instrument_name}: bid={best_bid}, ask={best_ask}")
                         continue
                     
                     # Check for reasonable spread
@@ -329,15 +357,18 @@ class OptionsPricer:
                     mid_price = (best_bid + best_ask) / 2
                     
                     if spread <= 0:
+                        logger.debug(f"Invalid spread for {instrument_name}")
                         continue
                     
                     # Basic instrument data
                     time_to_expiry = self._safe_time_to_expiry(instrument.expiration)
                     if time_to_expiry <= 0:
+                        logger.debug(f"Expired instrument: {instrument_name}")
                         continue
                         
                     strike = self._safe_float(instrument.strike)
                     if strike <= 0:
+                        logger.debug(f"Invalid strike for {instrument_name}")
                         continue
                     
                     market_price = mid_price
@@ -349,7 +380,8 @@ class OptionsPricer:
                         intrinsic = max(strike - spot_price, 0)
                     
                     # Basic validation - market price should be reasonable
-                    if market_price < intrinsic * 0.9:
+                    if market_price < intrinsic * 0.8:  # More lenient
+                        logger.debug(f"Market price below intrinsic for {instrument_name}: {market_price} vs {intrinsic}")
                         continue
                     
                     # Calculate IV
@@ -359,6 +391,7 @@ class OptionsPricer:
                     )
                     
                     if implied_vol is None or implied_vol <= 0 or implied_vol > 5:
+                        logger.debug(f"Invalid IV for {instrument_name}: {implied_vol}")
                         continue
                         
                     # Calculate theoretical price
@@ -367,11 +400,17 @@ class OptionsPricer:
                         self.risk_free_rate, implied_vol, instrument.option_type
                     )
                     
-                    # Calculate Greeks
+                    # Calculate Greeks with detailed debugging
                     greeks = self._calculate_greeks(
                         spot_price, strike, time_to_expiry,
                         self.risk_free_rate, implied_vol, instrument.option_type
                     )
+                    
+                    # Debug Greek calculation
+                    if len(results) < 3:  # Debug first few
+                        logger.info(f"Greek calculation for {instrument_name}:")
+                        logger.info(f"  S={spot_price}, K={strike}, T={time_to_expiry:.3f}, r={self.risk_free_rate}, σ={implied_vol:.3f}, type={instrument.option_type}")
+                        logger.info(f"  Greeks: Delta={greeks['delta']:.4f}, Gamma={greeks['gamma']:.4f}")
                     
                     # Store results
                     results[instrument_name] = {
@@ -392,8 +431,8 @@ class OptionsPricer:
                     }
                     
                     # Debug log for first few successful calculations
-                    if len(results) <= 3:
-                        logger.info(f"Calculated {instrument_name}: Price=${market_price:.2f}, IV={implied_vol:.1%}, Delta={greeks['delta']:.3f}")
+                    if len(results) <= 5:
+                        logger.info(f"✅ Calculated {instrument_name}: Price=${market_price:.2f}, IV={implied_vol:.1%}, Delta={greeks['delta']:.3f}")
                         
                 except Exception as e:
                     logger.debug(f"Error processing instrument {instrument_name}: {e}")
