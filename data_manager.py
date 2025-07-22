@@ -79,9 +79,9 @@ class DataManager:
         self._latest_pricing_results: Dict = {}
         self._last_pricing_update: datetime = datetime.now()
         # Add futures storage
-        self._futures: Dict[str, Future] = {}
-        self._futures_orderbooks: Dict[str, OrderBook] = {}
-        self._persistent_futures_orderbooks: Dict[str, OrderBook] = {}
+        self._futures_instruments: Dict[str, Instrument] = {}          # Store futures as instruments
+        self._futures_orderbooks: Dict[str, OrderBook] = {}           # Current futures orderbooks
+        self._persistent_futures_orderbooks: Dict[str, OrderBook] = {} # Persistent futures orderbooks
         
     def _safe_float(self, value, default=0.0) -> float:
         """Safely convert value to float"""
@@ -229,6 +229,8 @@ class DataManager:
                 'instruments': dict(self._instruments),
                 'orderbooks': dict(self._persistent_orderbooks),  # Use persistent data
                 'pricing': dict(self._persistent_pricing),        # Use persistent pricing
+                'futures_instruments': dict(self._futures_instruments),        # Add this line
+                'futures_orderbooks': dict(self._persistent_futures_orderbooks), # Add this line
                 'last_update': self._last_update
             }
 
@@ -290,5 +292,106 @@ class DataManager:
             logger.warning(f"Could not parse expiration timestamp {timestamp}: {e}")
             return datetime.now()
         
+    # Add this method:
+    def update_futures_instruments(self, futures_data: List[Dict]):
+        """Update futures list using existing Instrument class"""
+        logger.info(f"Updating {len(futures_data)} futures")
+        
+        with self._lock:
+            for i, data in enumerate(futures_data):
+                try:
+                    contract_size = self._safe_float(data.get('contract_size', 1.0))
+                    tick_size = self._safe_float(data.get('tick_size', 0.0001))
+                    min_trade_amount = self._safe_float(data.get('min_trade_amount', 0.1))
+                    
+                    # Use existing Instrument class, set strike=0, option_type='future'
+                    future_instrument = Instrument(
+                        instrument_name=str(data.get('instrument_name', '')),
+                        strike=0.0,  # Futures don't have strikes
+                        expiration=self._parse_expiration(data.get('expiration_timestamp')),
+                        option_type='future',  # Mark as future
+                        contract_size=contract_size,
+                        tick_size=tick_size,
+                        min_trade_amount=min_trade_amount
+                    )
+                    self._futures_instruments[future_instrument.instrument_name] = future_instrument
+                    
+                    if i < 2:
+                        logger.info(f"Added future: {future_instrument.instrument_name}")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing future {i}: {e}")
+                    continue
+
+    # Add this method:
+    def update_futures_orderbook(self, params: Dict):
+        """Update futures order book data with persistence"""
+        try:
+            channel = params.get('channel', '')
+            instrument_name = channel.split('.')[1] if '.' in channel else ''
+            data = params.get('data', {})
+            
+            with self._lock:
+                # Process bids and asks (same as options)
+                raw_bids = data.get('bids', [])
+                raw_asks = data.get('asks', [])
+                
+                safe_bids = []
+                for bid in raw_bids:
+                    if isinstance(bid, (list, tuple)) and len(bid) >= 2:
+                        price = self._safe_float(bid[0])
+                        size = self._safe_float(bid[1])
+                        if price > 0:
+                            safe_bids.append([price, size])
+
+                safe_asks = []
+                for ask in raw_asks:
+                    if isinstance(ask, (list, tuple)) and len(ask) >= 2:
+                        price = self._safe_float(ask[0])
+                        size = self._safe_float(ask[1])
+                        if price > 0:
+                            safe_asks.append([price, size])
+
+                orderbook = OrderBook(
+                    bids=safe_bids,
+                    asks=safe_asks,
+                    timestamp=datetime.now()
+                )
+
+                # Update current futures orderbooks
+                self._futures_orderbooks[instrument_name] = orderbook
+
+                # Update persistent storage (never cleared, only updated when we have good data)
+                best_bid = orderbook.best_bid
+                best_ask = orderbook.best_ask
+
+                if best_bid > 0 or best_ask > 0:
+                    self._persistent_futures_orderbooks[instrument_name] = orderbook
+                    self._last_seen_data[instrument_name] = datetime.now()
+
+                self._update_count += 1
+                
+        except Exception as e:
+            logger.error(f"Error updating futures orderbook for {instrument_name}: {e}")
+
+    # Add this method:
+    def get_forward_price_for_expiry(self, target_expiry: datetime) -> Optional[float]:
+        """Get forward price for closest matching expiry"""
+        with self._lock:
+            best_match = None
+            best_diff = float('inf')
+            
+            for future_name, future_inst in self._futures_instruments.items():
+                time_diff = abs((future_inst.expiration - target_expiry).total_seconds())
+                if time_diff < best_diff:
+                    best_diff = time_diff
+                    best_match = future_name
+            
+            if best_match:
+                orderbook = self._persistent_futures_orderbooks.get(best_match)
+                if orderbook and orderbook.best_bid > 0 and orderbook.best_ask > 0:
+                    return orderbook.mid_price
+            
+            return None
 
         

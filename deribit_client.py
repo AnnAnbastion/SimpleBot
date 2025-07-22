@@ -468,7 +468,7 @@ class DeribitClient:
             logger.error(f"Error handling messages: {e}")
             
     async def _process_message(self, data: Dict):
-        """Process individual messages"""
+        """Process individual messages (updated for futures)"""
         try:
             # Handle API responses
             if "id" in data and data["id"] in self.pending_requests:
@@ -483,8 +483,15 @@ class DeribitClient:
                 channel = params.get("channel", "")
                 
                 if channel.startswith("book."):
-                    # Order book update
-                    self.data_manager.update_orderbook(params)
+                    instrument_name = channel.split('.')[1] if '.' in channel else ''
+                    
+                    # Simple check: BTC futures format is BTC-DDMMMYY (e.g., BTC-27DEC24)
+                    # Options format is BTC-DDMMMYY-STRIKE-C/P (e.g., BTC-27DEC24-50000-C)
+                    if instrument_name.count('-') == 1:  # BTC-DATE = future
+                        self.data_manager.update_futures_orderbook(params)
+                    else:  # BTC-DATE-STRIKE-TYPE = option
+                        self.data_manager.update_orderbook(params)
+                        
                 elif channel == "deribit_price_index.btc_usd":
                     # BTC spot price update
                     price_data = params.get("data", {})
@@ -493,3 +500,152 @@ class DeribitClient:
                         
         except Exception as e:
             logger.error(f"Error processing message: {e}")
+    
+    # Add these methods to your existing DeribitClient class:
+
+    async def get_btc_futures(self) -> List[Dict]:
+        """Get BTC futures that match our option expiries"""
+        try:
+            logger.info("Getting BTC futures...")
+            
+            response = await self._send_request("public/get_instruments", {
+                "currency": "BTC",
+                "kind": "future"
+            })
+            
+            if "result" in response:
+                all_futures = response["result"]
+                logger.info(f"Received {len(all_futures)} total BTC futures")
+                
+                # Select futures that match option expiries
+                selected_futures = self._select_matching_futures(all_futures)
+                logger.info(f"Selected {len(selected_futures)} futures matching option expiries")
+                
+                self.data_manager.update_futures_instruments(selected_futures)
+                return selected_futures
+            else:
+                logger.error("Failed to get futures")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Error getting BTC futures: {e}")
+            return []
+
+    def _select_matching_futures(self, all_futures: List[Dict]) -> List[Dict]:
+        """Select futures that have nearest dates to our options"""
+        try:
+            if not self.selected_instruments:
+                return []
+                
+            # Get unique option expiries
+            option_expiries = set()
+            for inst in self.selected_instruments:
+                expiry = inst.get('expiration_timestamp', 0)
+                if expiry > 0:
+                    option_expiries.add(expiry)
+            
+            logger.info(f"Looking for futures matching {len(option_expiries)} option expiries")
+            
+            selected_futures = []
+            current_time = datetime.now().timestamp() * 1000
+            
+            # For each option expiry, find the nearest future
+            for option_expiry in option_expiries:
+                best_future = None
+                best_diff = float('inf')
+                
+                for future in all_futures:
+                    try:
+                        future_expiry = future.get('expiration_timestamp', 0)
+                        
+                        # Skip expired futures or perpetuals
+                        if future_expiry <= current_time or future_expiry == 0:
+                            continue
+                        
+                        # Calculate time difference in days
+                        time_diff = abs(future_expiry - option_expiry) / (1000 * 60 * 60 * 24)
+                        
+                        # Find the closest future to this option expiry
+                        if time_diff < best_diff:
+                            best_diff = time_diff
+                            best_future = future
+                            
+                    except Exception as e:
+                        continue
+                
+                # Add the best matching future (if within reasonable range)
+                if best_future and best_diff <= 30:  # Within 30 days
+                    if best_future not in selected_futures:  # Avoid duplicates
+                        selected_futures.append(best_future)
+                        exp_date = datetime.fromtimestamp(best_future['expiration_timestamp'] / 1000)
+                        logger.info(f"Selected future {best_future.get('instrument_name')} "
+                                f"(diff: {best_diff:.1f} days, expires: {exp_date.strftime('%Y-%m-%d')})")
+            
+            return selected_futures
+            
+        except Exception as e:
+            logger.error(f"Error selecting matching futures: {e}")
+            return []
+
+    async def subscribe_futures_data(self, futures: List[Dict]):
+        """Subscribe to futures order book data"""
+        if not futures:
+            logger.warning("No futures to subscribe to")
+            return
+            
+        channels = []
+        for future in futures:
+            instrument_name = future.get('instrument_name')
+            if instrument_name:
+                channels.append(f"book.{instrument_name}.100ms")
+        
+        if channels:
+            logger.info(f"Subscribing to {len(channels)} futures channels")
+            
+            response = await self._send_request("public/subscribe", {
+                "channels": channels
+            })
+            
+            if "result" in response:
+                logger.info(f"Successfully subscribed to {len(channels)} futures channels")
+                
+                # Get initial futures orderbooks
+                await self._get_initial_futures_orderbooks(futures)
+            else:
+                logger.error("Futures subscription failed")
+
+    async def _get_initial_futures_orderbooks(self, futures: List[Dict]):
+        """Get initial order book snapshots for futures"""
+        logger.info("Getting initial futures order book snapshots...")
+        
+        for future in futures:
+            try:
+                instrument_name = future.get('instrument_name')
+                if instrument_name:
+                    response = await self._send_request("public/get_order_book", {
+                        "instrument_name": instrument_name
+                    })
+                    
+                    if "result" in response:
+                        orderbook_data = response["result"]
+                        bids = orderbook_data.get('bids', [])
+                        asks = orderbook_data.get('asks', [])
+                        
+                        if bids or asks:
+                            self.data_manager.update_futures_orderbook({
+                                'channel': f'book.{instrument_name}',
+                                'data': {
+                                    'bids': bids,
+                                    'asks': asks
+                                }
+                            })
+                            
+                            best_bid = bids[0][0] if bids else 0
+                            best_ask = asks[0][0] if asks else 0
+                            logger.info(f"Got futures orderbook for {instrument_name}: ${best_bid} / ${best_ask}")
+                        
+            except Exception as e:
+                logger.debug(f"Error getting futures orderbook: {e}")
+                continue
+                
+            await asyncio.sleep(0.05)

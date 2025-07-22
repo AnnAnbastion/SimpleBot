@@ -36,15 +36,21 @@ class TradingApplication:
             if btc_instruments:
                 self.selected_instruments = btc_instruments
                 
+                # ADD THESE 2 LINES FOR FUTURES:
+                btc_futures = await self.deribit_client.get_btc_futures()
+                await self.deribit_client.subscribe_futures_data(btc_futures)
+                
                 # Subscribe to market data (WebSocket real-time updates)
                 await self.deribit_client.subscribe_market_data(btc_instruments)
                 await asyncio.sleep(3)  # Wait for initial WebSocket data
                 
-                # Check what data we have
+                # Check what data we have (ADD FUTURES INFO):
                 market_data = self.data_manager.get_all_market_data()
+                display_data = self.data_manager.get_display_data()
                 spot_price = self.data_manager.get_spot_price()
                 logger.info(f"Current BTC spot: ${spot_price:,.2f}")
-                logger.info(f"Instruments: {len(market_data.get('instruments', {}))}")
+                logger.info(f"Options instruments: {len(market_data.get('instruments', {}))}")
+                logger.info(f"Futures instruments: {len(display_data.get('futures_instruments', {}))}")
                 
                 # Count active orderbooks safely
                 active_count = 0
@@ -58,7 +64,20 @@ class TradingApplication:
                     except:
                         continue
                         
-                logger.info(f"Active orderbooks: {active_count}")
+                # Count active futures orderbooks
+                futures_active_count = 0
+                for ob in display_data.get('futures_orderbooks', {}).values():
+                    try:
+                        if hasattr(ob, 'best_bid') and hasattr(ob, 'best_ask'):
+                            bid = float(ob.best_bid) if ob.best_bid else 0
+                            ask = float(ob.best_ask) if ob.best_ask else 0
+                            if bid > 0 and ask > 0:
+                                futures_active_count += 1
+                    except:
+                        continue
+                        
+                logger.info(f"Active options orderbooks: {active_count}")
+                logger.info(f"Active futures orderbooks: {futures_active_count}")
                 
                 # Start both loops concurrently
                 await asyncio.gather(
