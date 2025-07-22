@@ -20,10 +20,16 @@ class TradingApplication:
         self.running = False
         self.selected_instruments = []
         
+        # NEW: Configuration for pricing model and synthetic method
+        self.use_black_model = True  # Set to False to use Black-Scholes
+        self.synthetic_method = 'A'  # 'A' for minimal parity gap, 'B' for basis curve
+        
     async def start_async_components(self):
         """Start the async trading components"""
         try:
             logger.info("Starting async components...")
+            logger.info(f"Using {'Black model' if self.use_black_model else 'Black-Scholes model'} "
+                       f"with synthetic method {self.synthetic_method}")
             
             # Connect to Deribit
             await self.deribit_client.connect()
@@ -36,7 +42,7 @@ class TradingApplication:
             if btc_instruments:
                 self.selected_instruments = btc_instruments
                 
-                # ADD THESE 2 LINES FOR FUTURES:
+                # Get futures for Black model
                 btc_futures = await self.deribit_client.get_btc_futures()
                 await self.deribit_client.subscribe_futures_data(btc_futures)
                 
@@ -44,7 +50,7 @@ class TradingApplication:
                 await self.deribit_client.subscribe_market_data(btc_instruments)
                 await asyncio.sleep(3)  # Wait for initial WebSocket data
                 
-                # Check what data we have (ADD FUTURES INFO):
+                # Check what data we have
                 market_data = self.data_manager.get_all_market_data()
                 display_data = self.data_manager.get_display_data()
                 spot_price = self.data_manager.get_spot_price()
@@ -79,10 +85,11 @@ class TradingApplication:
                 logger.info(f"Active options orderbooks: {active_count}")
                 logger.info(f"Active futures orderbooks: {futures_active_count}")
                 
-                # Start both loops concurrently
+                # Start all loops concurrently
                 await asyncio.gather(
-                    self.data_update_loop(),      # Downloads data every 100ms
-                    self.pricing_update_loop()    # Calculates pricing every 100ms
+                    self.data_update_loop(),        # Downloads data every 100ms
+                    self.pricing_update_loop(),     # Calculates pricing every 100ms
+                    self.cache_maintenance_loop()   # NEW: Maintains cache every 30 seconds
                 )
             else:
                 logger.error("No instruments found, cannot continue")
@@ -121,7 +128,14 @@ class TradingApplication:
                     display_data = self.data_manager.get_display_data()
                     active_obs = len(display_data.get('orderbooks', {}))
                     active_pricing = len(display_data.get('pricing', {}))
-                    logger.info(f"Data cycle {iteration}: {active_obs} orderbooks, {active_pricing} priced instruments")
+                    
+                    # NEW: Show cache status
+                    if self.use_black_model:
+                        cache_status = self.data_manager.get_synthetic_futures_cache_status()
+                        logger.info(f"Data cycle {iteration}: {active_obs} orderbooks, {active_pricing} priced instruments, "
+                                  f"cache: {cache_status['cache_size']} entries")
+                    else:
+                        logger.info(f"Data cycle {iteration}: {active_obs} orderbooks, {active_pricing} priced instruments")
                 
                 await asyncio.sleep(0.1)  # 100ms
                 
@@ -198,23 +212,72 @@ class TradingApplication:
             try:
                 iteration += 1
                 
-                # Calculate prices and greeks immediately with current data
-                pricing_results = self.pricer.calculate_all()
+                # Calculate prices and greeks with selected model
+                pricing_results = self.pricer.calculate_all(
+                    synthetic_method=self.synthetic_method,
+                    use_black_model=self.use_black_model
+                )
                 
                 # Store results in data manager for GUI access
                 self.data_manager.store_pricing_results(pricing_results)
                 
-                # Log occasionally
+                # Log occasionally with model info
                 if iteration % 50 == 0:  # Every 5 seconds
                     spot_price = self.data_manager.get_spot_price()
-                    logger.info(f"Pricing update: Spot=${spot_price:,.2f}, Priced {len(pricing_results)} instruments")
+                    model_info = f"{'Black' if self.use_black_model else 'BS'}"
+                    
+                    # Show cache efficiency for Black model
+                    if self.use_black_model and pricing_results:
+                        cached_count = sum(1 for r in pricing_results.values() if r.get('was_cached', False))
+                        cache_efficiency = cached_count / len(pricing_results) * 100 if pricing_results else 0
+                        logger.info(f"Pricing update ({model_info}): Spot=${spot_price:,.2f}, "
+                                  f"Priced {len(pricing_results)} instruments, "
+                                  f"Cache efficiency: {cache_efficiency:.1f}%")
+                    else:
+                        logger.info(f"Pricing update ({model_info}): Spot=${spot_price:,.2f}, "
+                                  f"Priced {len(pricing_results)} instruments")
                 
                 await asyncio.sleep(0.1)  # 100ms
                 
             except Exception as e:
                 logger.error(f"Error in pricing loop: {e}")
                 await asyncio.sleep(1)
+    
+    async def cache_maintenance_loop(self):
+        """NEW: Maintain synthetic futures cache every 30 seconds"""
+        if not self.use_black_model:
+            return  # No cache maintenance needed for Black-Scholes
+            
+        logger.info("Starting cache maintenance loop (30s intervals)...")
+        
+        # Wait for initial data to be available
+        await asyncio.sleep(10)
+        
+        while self.running:
+            try:
+                # Get current market data
+                display_data = self.data_manager.get_display_data()
+                instruments = display_data.get('instruments', {})
+                orderbooks = display_data.get('orderbooks', {})
+                spot_price = self.data_manager.get_spot_price()
                 
+                if instruments and orderbooks and spot_price > 0:
+                    # Force cache update by calling the pricer method
+                    self.pricer.update_synthetic_futures_cache_if_needed(
+                        instruments, orderbooks, spot_price, self.synthetic_method
+                    )
+                    
+                    # Log cache status
+                    cache_status = self.data_manager.get_synthetic_futures_cache_status()
+                    logger.info(f"Cache maintenance: {cache_status['cache_size']} entries, "
+                               f"last update: {cache_status['time_since_update_seconds']:.1f}s ago")
+                
+                await asyncio.sleep(30)  # 30 seconds
+                
+            except Exception as e:
+                logger.error(f"Error in cache maintenance loop: {e}")
+                await asyncio.sleep(30)
+    
     def start_gui(self):
         """Start GUI on main thread"""
         self.running = True
@@ -274,9 +337,28 @@ class TradingApplication:
             if self.gui and self.gui.root:
                 self.gui.root.after(5000, self.schedule_gui_update)  # 5 seconds
 
+    def set_pricing_model(self, use_black_model: bool, synthetic_method: str = 'A'):
+        """NEW: Method to change pricing model configuration"""
+        self.use_black_model = use_black_model
+        self.synthetic_method = synthetic_method
+        
+        logger.info(f"Pricing model changed to: {'Black' if use_black_model else 'Black-Scholes'}")
+        if use_black_model:
+            logger.info(f"Synthetic method set to: {synthetic_method}")
+            
+            # Clear cache when switching methods
+            self.data_manager.clear_stale_synthetic_futures_cache()
+
 def main():
     """Main entry point"""
     app = TradingApplication()
+    
+    # CONFIGURATION: Change these to switch models
+    app.set_pricing_model(
+        use_black_model=True,     # True for Black model, False for Black-Scholes
+        synthetic_method='A'      # 'A' for minimal parity gap, 'B' for basis curve
+    )
+    
     app.start_gui()
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
-# data_manager.py (update the OrderBook class and update_orderbook method)
+# data_manager.py (update the import section)
 import threading
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta  # ← Added timedelta here
 import pandas as pd
 import logging
 
@@ -82,6 +82,10 @@ class DataManager:
         self._futures_instruments: Dict[str, Instrument] = {}          # Store futures as instruments
         self._futures_orderbooks: Dict[str, OrderBook] = {}           # Current futures orderbooks
         self._persistent_futures_orderbooks: Dict[str, OrderBook] = {} # Persistent futures orderbooks
+        # NEW: Add synthetic future price caching
+        self._synthetic_futures_cache: Dict[str, Dict] = {}  # Cache by expiry date string
+        self._synthetic_futures_last_update: datetime = datetime.min
+        self._synthetic_futures_update_interval: timedelta = timedelta(minutes=1)
         
     def _safe_float(self, value, default=0.0) -> float:
         """Safely convert value to float"""
@@ -231,6 +235,7 @@ class DataManager:
                 'pricing': dict(self._persistent_pricing),        # Use persistent pricing
                 'futures_instruments': dict(self._futures_instruments),        # Add this line
                 'futures_orderbooks': dict(self._persistent_futures_orderbooks), # Add this line
+                'synthetic_futures_cache': dict(self._synthetic_futures_cache),  # NEW
                 'last_update': self._last_update
             }
 
@@ -393,5 +398,94 @@ class DataManager:
                     return orderbook.mid_price
             
             return None
+        
+    
+    def get_cached_synthetic_future_price(self, expiry: datetime, method: str = 'A') -> Optional[float]:
+        """
+        Get cached synthetic future price for a specific expiry
+        Returns None if cache is stale or doesn't exist
+        """
+        with self._lock:
+            # Check if cache needs update (older than 1 minute)
+            now = datetime.now()
+            if (now - self._synthetic_futures_last_update) > self._synthetic_futures_update_interval:
+                return None  # Cache is stale
+            
+            # Create cache key
+            expiry_str = expiry.strftime('%Y-%m-%d')
+            cache_key = f"{expiry_str}_{method}"
+            
+            cached_data = self._synthetic_futures_cache.get(cache_key)
+            if cached_data:
+                return cached_data.get('future_price')
+            
+            return None
+    
+    def store_synthetic_future_price(self, expiry: datetime, method: str, 
+                                   future_price: float, calculation_details: Dict = None):
+        """
+        Store calculated synthetic future price in cache
+        """
+        with self._lock:
+            expiry_str = expiry.strftime('%Y-%m-%d')
+            cache_key = f"{expiry_str}_{method}"
+            
+            self._synthetic_futures_cache[cache_key] = {
+                'future_price': future_price,
+                'expiry': expiry,
+                'method': method,
+                'calculated_at': datetime.now(),
+                'details': calculation_details or {}
+            }
+    
+    def update_synthetic_futures_cache_timestamp(self):
+        """
+        Update the cache timestamp to mark it as fresh
+        """
+        with self._lock:
+            self._synthetic_futures_last_update = datetime.now()
+    
+    def is_synthetic_futures_cache_stale(self) -> bool:
+        """
+        Check if the synthetic futures cache is stale
+        """
+        with self._lock:
+            return (datetime.now() - self._synthetic_futures_last_update) > self._synthetic_futures_update_interval
+    
+    def get_synthetic_futures_cache_status(self) -> Dict:
+        """
+        Get status information about the synthetic futures cache
+        """
+        with self._lock:
+            now = datetime.now()
+            time_since_update = now - self._synthetic_futures_last_update
+            
+            return {
+                'cache_size': len(self._synthetic_futures_cache),
+                'last_update': self._synthetic_futures_last_update,
+                'time_since_update_seconds': time_since_update.total_seconds(),
+                'is_stale': time_since_update > self._synthetic_futures_update_interval,
+                'cached_expiries': list(set([v['expiry'].strftime('%Y-%m-%d') 
+                                           for v in self._synthetic_futures_cache.values()]))
+            }
+    
+    def clear_stale_synthetic_futures_cache(self):
+        """
+        Clear cache entries that are too old (older than 5 minutes)
+        """
+        with self._lock:
+            now = datetime.now()
+            stale_threshold = timedelta(minutes=5)
+            
+            keys_to_remove = []
+            for key, data in self._synthetic_futures_cache.items():
+                if (now - data['calculated_at']) > stale_threshold:
+                    keys_to_remove.append(key)
+            
+            for key in keys_to_remove:
+                del self._synthetic_futures_cache[key]
+            
+            if keys_to_remove:
+                logger.info(f"Cleared {len(keys_to_remove)} stale synthetic future cache entries")
 
         
