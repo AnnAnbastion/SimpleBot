@@ -4,13 +4,14 @@ from datetime import datetime
 from typing import Dict, Optional
 import logging
 from scipy.optimize import brentq
+from scipy.stats import norm  # Use scipy's proven implementation
 
 logger = logging.getLogger(__name__)
 
 class OptionsPricer:
     def __init__(self, data_manager):
         self.data_manager = data_manager
-        self.risk_free_rate = 0.05  # 5% risk-free rate
+        self.risk_free_rate = 0.05  # 5% risk-free rate (more reasonable)
         
     def _safe_float(self, value, default=0.0) -> float:
         """Safely convert value to float"""
@@ -32,7 +33,7 @@ class OptionsPricer:
                 now = datetime.now()
                 time_diff = (expiration - now).total_seconds()
                 years = time_diff / (365.25 * 24 * 3600)
-                return max(years, 1/365)  # Minimum 1 day
+                return max(years, 1/365)  # Minimum 1 day to avoid division by zero
             else:
                 logger.warning(f"Invalid expiration type: {type(expiration)}")
                 return 1/365
@@ -40,42 +41,16 @@ class OptionsPricer:
             logger.error(f"Error calculating time to expiry: {e}")
             return 1/365
 
-    def _normal_cdf(self, x: float) -> float:
-        """Calculate cumulative normal distribution N(x)"""
-        try:
-            # Using the error function approximation
-            return 0.5 * (1.0 + np.sign(x) * np.sqrt(1.0 - np.exp(-2.0 * x * x / np.pi)))
-        except:
-            # Fallback to scipy if available, otherwise simple approximation
-            try:
-                from scipy.stats import norm
-                return norm.cdf(x)
-            except:
-                # Simple approximation for extreme cases
-                if x > 6:
-                    return 1.0
-                elif x < -6:
-                    return 0.0
-                else:
-                    return 0.5
-
-    def _normal_pdf(self, x: float) -> float:
-        """Calculate normal probability density function φ(x)"""
-        try:
-            return (1.0 / np.sqrt(2.0 * np.pi)) * np.exp(-0.5 * x * x)
-        except:
-            return 0.0
-
     def black_scholes_price(self, S: float, K: float, T: float, r: float, 
                            sigma: float, option_type: str) -> float:
         """
-        Calculate Black-Scholes option price using direct equations
+        Calculate Black-Scholes option price using proven scipy functions
         
         S: Current stock price
         K: Strike price  
         T: Time to expiration (in years)
-        r: Risk-free rate
-        sigma: Volatility
+        r: Risk-free rate (annualized)
+        sigma: Volatility (annualized)
         option_type: 'call' or 'put'
         """
         try:
@@ -84,7 +59,7 @@ class OptionsPricer:
             K = self._safe_float(K)
             T = self._safe_float(T)
             r = self._safe_float(r)
-            sigma = self._safe_float(sigma, 0.3)
+            sigma = self._safe_float(sigma, 0.3)  # Default to 30% vol, not 100%
             
             if S <= 0 or K <= 0 or sigma <= 0:
                 return 0.0
@@ -100,11 +75,11 @@ class OptionsPricer:
             d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
             d2 = d1 - sigma * np.sqrt(T)
             
-            # Calculate option price
+            # Calculate option price using scipy's norm functions
             if option_type.lower() == 'call':
-                price = S * self._normal_cdf(d1) - K * np.exp(-r * T) * self._normal_cdf(d2)
+                price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
             else:  # put
-                price = K * np.exp(-r * T) * self._normal_cdf(-d2) - S * self._normal_cdf(-d1)
+                price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
                 
             return max(price, 0.0)
             
@@ -115,7 +90,7 @@ class OptionsPricer:
     def calculate_greeks(self, S: float, K: float, T: float, r: float, 
                         sigma: float, option_type: str) -> Dict[str, float]:
         """
-        Calculate option Greeks using direct equations
+        Calculate option Greeks using proven scipy functions
         
         Returns: Dictionary with delta, gamma, theta, vega, rho
         """
@@ -135,37 +110,37 @@ class OptionsPricer:
             d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
             d2 = d1 - sigma * np.sqrt(T)
             
-            # Calculate Greeks
+            # Calculate Greeks using scipy's norm functions
             
             # Delta: ∂V/∂S
             if option_type.lower() == 'call':
-                delta = self._normal_cdf(d1)
+                delta = norm.cdf(d1)
             else:  # put
-                delta = self._normal_cdf(d1) - 1.0
+                delta = norm.cdf(d1) - 1.0
             
             # Gamma: ∂²V/∂S² (same for calls and puts)
-            gamma = self._normal_pdf(d1) / (S * sigma * np.sqrt(T))
+            gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
             
             # Theta: -∂V/∂t (time decay)
-            theta_common = -(S * self._normal_pdf(d1) * sigma) / (2 * np.sqrt(T))
+            theta_common = -(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T))
             if option_type.lower() == 'call':
-                theta = theta_common - r * K * np.exp(-r * T) * self._normal_cdf(d2)
+                theta = theta_common - r * K * np.exp(-r * T) * norm.cdf(d2)
             else:  # put
-                theta = theta_common + r * K * np.exp(-r * T) * self._normal_cdf(-d2)
+                theta = theta_common + r * K * np.exp(-r * T) * norm.cdf(-d2)
             
             # Convert theta to daily (divide by 365)
             theta_daily = theta / 365.0
             
             # Vega: ∂V/∂σ (same for calls and puts)
-            vega = S * self._normal_pdf(d1) * np.sqrt(T)
+            vega = S * norm.pdf(d1) * np.sqrt(T)
             # Convert to per 1% volatility change
             vega_percent = vega / 100.0
             
             # Rho: ∂V/∂r
             if option_type.lower() == 'call':
-                rho = K * T * np.exp(-r * T) * self._normal_cdf(d2)
+                rho = K * T * np.exp(-r * T) * norm.cdf(d2)
             else:  # put
-                rho = -K * T * np.exp(-r * T) * self._normal_cdf(-d2)
+                rho = -K * T * np.exp(-r * T) * norm.cdf(-d2)
             
             # Convert rho to per 1% rate change
             rho_percent = rho / 100.0
@@ -190,16 +165,62 @@ class OptionsPricer:
     def calculate_implied_volatility(self, market_price: float, S: float, K: float, 
                                    T: float, r: float, option_type: str) -> Optional[float]:
         """
-        Calculate implied volatility using Newton-Raphson method
-        
-        Uses the direct Black-Scholes equations with numerical methods
+        Calculate implied volatility using Brent's method with better bounds
         """
-        def objective(vol):
-            return self.black_scholes_price(S, K, T, r, vol, option_type) - market_price
-        
         try:
-            return brentq(objective, 0.001, 5.0)  # Search between 0.1% and 500%
-        except:
+            # Input validation
+            S = self._safe_float(S)
+            K = self._safe_float(K)
+            T = self._safe_float(T)
+            r = self._safe_float(r)
+            market_price = self._safe_float(market_price)
+            
+            if T <= 0 or market_price <= 0 or S <= 0 or K <= 0:
+                return None
+            
+            # Calculate intrinsic value for bounds checking
+            if option_type.lower() == 'call':
+                intrinsic_value = max(S - K, 0)
+            else:
+                intrinsic_value = max(K - S, 0)
+            
+            # Market price should be at least intrinsic value
+            if market_price < intrinsic_value * 0.9:
+                logger.debug(f"Market price {market_price} below intrinsic {intrinsic_value}")
+                return None
+            
+            def objective(vol):
+                return self.black_scholes_price(S, K, T, r, vol, option_type) - market_price
+            
+            # Test bounds to ensure we have a valid bracket
+            low_vol = 0.001   # 0.1%
+            high_vol = 20.0   # 2000%
+            
+            # Check if we have opposite signs (required for Brent method)
+            low_price = objective(low_vol)
+            high_price = objective(high_vol)
+            
+            if low_price * high_price > 0:
+                # Same sign, try different bounds
+                if low_price > 0:  # Both positive, try lower vol
+                    low_vol = 0.0001
+                    low_price = objective(low_vol)
+                else:  # Both negative, try higher vol
+                    high_vol = 30.0
+                    high_price = objective(high_vol)
+            
+            # Use Brent's method
+            iv = brentq(objective, low_vol, high_vol, xtol=1e-6, maxiter=1000)
+            
+            # Validate result
+            if 0.0001 <= iv <= 20.0:
+                return iv
+            else:
+                logger.debug(f"IV out of reasonable range: {iv}")
+                return None
+                
+        except Exception as e:
+            logger.debug(f"Error calculating IV: {e}")
             return None
 
     def calculate_all(self) -> Dict:
@@ -225,23 +246,32 @@ class OptionsPricer:
             
             for instrument_name, instrument in instruments.items():
                 try:
+                    # Skip futures for now
+                    if instrument.option_type == 'future':
+                        continue
+                        
                     # Get market data for this instrument
                     orderbook = orderbooks.get(instrument_name)
                     if not orderbook:
                         continue
                         
-                    best_bid = self._safe_float(orderbook.best_bid)
-                    best_ask = self._safe_float(orderbook.best_ask)
+                    # CONVERT BTC PRICES TO USD BY MULTIPLYING BY SPOT PRICE
+                    best_bid_btc = self._safe_float(orderbook.best_bid)
+                    best_ask_btc = self._safe_float(orderbook.best_ask)
+                    
+                    # Convert to USD
+                    best_bid_usd = best_bid_btc * spot_price
+                    best_ask_usd = best_ask_btc * spot_price
                     
                     # Basic validation
-                    if best_bid <= 0 or best_ask <= 0:
+                    if best_bid_usd <= 0 or best_ask_usd <= 0:
                         continue
                     
-                    if best_ask <= best_bid:  # Invalid spread
+                    if best_ask_usd <= best_bid_usd:  # Invalid spread
                         continue
                     
-                    # Calculate market price
-                    market_price = (best_bid + best_ask) / 2.0
+                    # Calculate market price in USD
+                    market_price_usd = (best_bid_usd + best_ask_usd) / 2.0
                     
                     # Get instrument parameters
                     strike = self._safe_float(instrument.strike)
@@ -251,17 +281,17 @@ class OptionsPricer:
                     if strike <= 0 or time_to_expiry <= 0:
                         continue
                     
-                    # Calculate intrinsic and time value
+                    # Calculate intrinsic and time value (in USD)
                     if option_type == 'call':
-                        intrinsic_value = max(spot_price - strike, 0)
+                        intrinsic_value_usd = max(spot_price - strike, 0)
                     else:
-                        intrinsic_value = max(strike - spot_price, 0)
+                        intrinsic_value_usd = max(strike - spot_price, 0)
                     
-                    time_value = max(market_price - intrinsic_value, 0)
+                    time_value_usd = max(market_price_usd - intrinsic_value_usd, 0)
                     
-                    # Calculate implied volatility
+                    # Calculate implied volatility (using USD prices)
                     implied_vol = self.calculate_implied_volatility(
-                        market_price, spot_price, strike, 
+                        market_price_usd, spot_price, strike, 
                         time_to_expiry, self.risk_free_rate, option_type
                     )
                     
@@ -269,8 +299,8 @@ class OptionsPricer:
                         logger.debug(f"Could not calculate IV for {instrument_name}")
                         continue
                     
-                    # Calculate theoretical price using calculated IV
-                    theoretical_price = self.black_scholes_price(
+                    # Calculate theoretical price using calculated IV (in USD)
+                    theoretical_price_usd = self.black_scholes_price(
                         spot_price, strike, time_to_expiry,
                         self.risk_free_rate, implied_vol, option_type
                     )
@@ -281,27 +311,30 @@ class OptionsPricer:
                         self.risk_free_rate, implied_vol, option_type
                     )
                     
-                    # Store results
+                    # Store results (keeping both BTC and USD prices for reference)
                     results[instrument_name] = {
                         'spot_price': spot_price,
                         'strike': strike,
                         'time_to_expiry': time_to_expiry,
                         'option_type': option_type,
-                        'market_price': market_price,
-                        'bid': best_bid,
-                        'ask': best_ask,
-                        'theoretical_price': theoretical_price,
+                        'market_price': market_price_usd,  # USD price for calculations
+                        'market_price_btc': (best_bid_btc + best_ask_btc) / 2.0,  # Original BTC price
+                        'bid': best_bid_usd,  # USD bid
+                        'ask': best_ask_usd,  # USD ask
+                        'bid_btc': best_bid_btc,  # Original BTC bid
+                        'ask_btc': best_ask_btc,  # Original BTC ask
+                        'theoretical_price': theoretical_price_usd,
                         'implied_volatility': implied_vol,
-                        'price_diff': market_price - theoretical_price,
-                        'intrinsic_value': intrinsic_value,
-                        'time_value': time_value,
+                        'price_diff': market_price_usd - theoretical_price_usd,
+                        'intrinsic_value': intrinsic_value_usd,
+                        'time_value': time_value_usd,
                         **greeks,
                         'timestamp': datetime.now()
                     }
                     
                     # Log first few successful calculations
                     if len(results) <= 5:
-                        logger.info(f"✅ {instrument_name}: ${market_price:.2f}, IV={implied_vol:.1%}, Δ={greeks['delta']:.3f}")
+                        logger.info(f"✅ {instrument_name}: ${market_price_usd:.2f} (₿{best_bid_btc + best_ask_btc:.6f}), IV={implied_vol:.1%}, Δ={greeks['delta']:.3f}")
                         
                 except Exception as e:
                     logger.debug(f"Error processing {instrument_name}: {e}")

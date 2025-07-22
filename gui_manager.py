@@ -65,7 +65,7 @@ class MarketDataGUI:
             num_value = self._safe_float(value)
             if num_value == 0:
                 return default_text
-            return f"{num_value:.1%}"
+            return f"{num_value:.2%}"
         except:
             return default_text
         
@@ -430,9 +430,9 @@ class MarketDataGUI:
                     values = (
                         self._safe_format_number(instrument.strike, 0),
                         instrument.expiration.strftime('%m/%d') if hasattr(instrument.expiration, 'strftime') else "N/A",
-                        self._safe_format_number(best_bid, 4),
-                        self._safe_format_number(best_ask, 4),
-                        self._safe_format_number(mid_price, 4),
+                        self._safe_format_number(best_bid, 3),
+                        self._safe_format_number(best_ask, 3),
+                        self._safe_format_number(mid_price, 3),
                         f"{orderbook.timestamp.strftime('%H:%M:%S')} ({age_str})" if hasattr(orderbook.timestamp, 'strftime') else "N/A"
                     )
                     
@@ -494,11 +494,11 @@ class MarketDataGUI:
                     values = (
                         self._safe_format_number(instrument.strike, 0),
                         instrument.expiration.strftime('%m/%d') if hasattr(instrument.expiration, 'strftime') else "N/A",
-                        self._safe_format_number(result.get('market_price'), 4),
-                        self._safe_format_number(result.get('theoretical_price'), 4),
+                        self._safe_format_number(result.get('market_price'), 3),
+                        self._safe_format_number(result.get('theoretical_price'), 3),
                         self._safe_format_percentage(result.get('implied_volatility')),
                         self._safe_format_number(result.get('delta'), 3, "+0.000"),
-                        self._safe_format_number(result.get('gamma'), 3),
+                        self._safe_format_number(result.get('gamma'), 6),
                         self._safe_format_number(result.get('theta'), 3, "+0.000"),
                         self._safe_format_number(result.get('vega'), 3)
                     )
